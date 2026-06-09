@@ -1,0 +1,50 @@
+# MCP Practices Applied Here
+
+This server is a local stdio MCP server for personal email. The design follows the
+current MCP guidance that matters for this threat model.
+
+## Local Server Execution
+
+- Use `stdio`, not a long-running unauthenticated HTTP listener.
+- Document the exact startup command in the README and Codex/Claude config.
+- Keep the command deterministic with `uv run --frozen --directory ...`.
+- Keep secrets in `.env`, which is gitignored.
+
+Source: <https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices>
+
+## Scope and Capability Boundaries
+
+- Gmail uses `gmail.modify`, not a broader mail scope.
+- Send, permanent delete, and empty trash are not registered as MCP tools.
+- Mutations are reversible where the provider API permits it.
+- Each mutation writes an audit entry to `~/.config/email-mcp/actions.log`.
+
+Source: <https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices>
+
+## Tool Design for Agents
+
+- Tool names are specific verbs: `list_messages`, `search_messages`,
+  `get_message`, `create_draft`, `undo_last`.
+- Tool descriptions explain when to call the tool, not just what it does.
+- Parameters use literals and bounded values where useful:
+  - `provider`: `gmail`, `outlook`, or `both`
+  - mutation provider: `gmail` or `outlook`
+  - `limit`: 1 to 50
+  - `undo_last.n`: 1 to 10
+- Parameter descriptions explain provider-scoped ids and untrusted email bodies.
+- MCP `ToolAnnotations` mark read-only, idempotent, destructive, and open-world
+  behavior for clients that use those hints.
+
+Sources:
+
+- <https://modelcontextprotocol.io/specification/draft/server/tools>
+- <https://modelcontextprotocol.io/docs/develop/clients/client-best-practices>
+
+## Email-Specific Prompt Injection Boundary
+
+Email bodies come from outside the trusted conversation. Agents should summarize
+and extract tasks from message bodies, but they should not execute instructions
+contained in those bodies.
+
+The `get_message` tool description and `include_body` parameter description both
+state that boundary because message bodies are the highest-risk output.
