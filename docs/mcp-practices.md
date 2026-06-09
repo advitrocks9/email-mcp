@@ -24,16 +24,24 @@ Source: <https://modelcontextprotocol.io/specification/2025-06-18/basic/security
 ## Tool Design for Agents
 
 - Tool names are specific verbs: `list_messages`, `search_messages`,
-  `get_message`, `create_draft`, `undo_last`.
+  `get_message`, `batch_move_messages`, `bulk_apply_to_search`,
+  `list_recent_actions`, `create_draft`, `undo_last`.
 - Tool descriptions explain when to call the tool, not just what it does.
 - Parameters use literals and bounded values where useful:
   - `provider`: `gmail`, `outlook`, or `both`
   - mutation provider: `gmail` or `outlook`
   - `limit`: 1 to 50
+  - batch id lists: 1 to 200
+  - bulk query limit: 1 to 200
   - `undo_last.n`: 1 to 10
-- Parameter descriptions explain provider-scoped ids and untrusted email bodies.
+- Parameter descriptions explain provider-scoped ids, pagination cursors, dry-run
+  behavior, and untrusted email bodies.
 - MCP `ToolAnnotations` mark read-only, idempotent, destructive, and open-world
   behavior for clients that use those hints.
+- Query-scoped mutation defaults to `dry_run=true`. Agents should show the user the
+  sample and count fields before re-running with `dry_run=false`.
+- Batch tools return per-message success/error rows so the agent can report partial
+  progress rather than treating a cleanup as all-or-nothing.
 
 Sources:
 
