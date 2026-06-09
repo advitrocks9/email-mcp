@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import time
+import urllib.parse
 from email.message import EmailMessage
 from typing import Any
 
@@ -67,6 +68,7 @@ _FOLDER_LABEL: dict[str, str | None] = {
     "deleted": "TRASH",
     "spam": "SPAM",
     "junk": "SPAM",
+    "archive": None,
     "starred": "STARRED",
     "important": "IMPORTANT",
     "unread": "UNREAD",
@@ -98,16 +100,32 @@ def _hdr(headers: list[dict[str, Any]], name: str) -> str:
     return ""
 
 
+def _has_attachment(payload: dict[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    if payload.get("filename") or (payload.get("body") or {}).get("attachmentId"):
+        return True
+    return any(_has_attachment(part) for part in payload.get("parts", []) or [])
+
+
 def _norm(message: dict[str, Any]) -> dict[str, Any]:
     headers = (message.get("payload") or {}).get("headers", [])
     labels = message.get("labelIds", []) or []
+    list_unsubscribe = _hdr(headers, "List-Unsubscribe")
     return {
         "provider": "gmail",
         "id": message["id"],
+        "thread_id": message.get("threadId"),
         "from": _hdr(headers, "From"),
+        "to": _hdr(headers, "To"),
+        "cc": _hdr(headers, "Cc"),
         "subject": _hdr(headers, "Subject"),
         "date": _hdr(headers, "Date"),
         "unread": "UNREAD" in labels,
+        "has_attachment": _has_attachment(message.get("payload")),
+        "importance": "important" if "IMPORTANT" in labels else "",
+        "list_unsubscribe": list_unsubscribe,
+        "list_unsubscribe_post": _hdr(headers, "List-Unsubscribe-Post") if list_unsubscribe else "",
         "snippet": str(message.get("snippet") or "")[:200],
         "folders": labels,
     }
@@ -117,30 +135,50 @@ def list_folders() -> list[dict[str, Any]]:
     return [{"id": label["id"], "name": label.get("name")} for label in _labels()]
 
 
-def list_messages(folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15) -> list[dict[str, Any]]:
-    import urllib.parse
-
+def list_messages_page(
+    folder: str = "inbox",
+    query: str = "",
+    unread_only: bool = False,
+    limit: int = 15,
+    cursor: str = "",
+) -> dict[str, Any]:
     params = {"maxResults": int(limit)}
     gmail_query = query or ""
     if unread_only:
         gmail_query = (gmail_query + " is:unread").strip()
+    if folder and folder.lower() == "archive":
+        gmail_query = (gmail_query + " -in:inbox -in:sent -in:drafts -in:trash -in:spam").strip()
     if gmail_query:
         params["q"] = gmail_query
     label_id = _label_id(folder)
     if label_id:
         params["labelIds"] = label_id
+    if cursor:
+        params["pageToken"] = cursor
 
-    listed = http("GET", f"{API}/messages?{urllib.parse.urlencode(params)}", _auth()).get("messages", []) or []
+    response = http("GET", f"{API}/messages?{urllib.parse.urlencode(params)}", _auth())
+    listed = response.get("messages", []) or []
     messages: list[dict[str, Any]] = []
     for item in listed[: int(limit)]:
         message = http(
             "GET",
             f"{API}/messages/{item['id']}?format=metadata"
-            "&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
+            "&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc"
+            "&metadataHeaders=Subject&metadataHeaders=Date"
+            "&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post",
             _auth(),
         )
         messages.append(_norm(message))
-    return messages
+    return {
+        "provider": "gmail",
+        "messages": messages,
+        "next_cursor": response.get("nextPageToken", ""),
+        "result_size_estimate": response.get("resultSizeEstimate", len(messages)),
+    }
+
+
+def list_messages(folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15) -> list[dict[str, Any]]:
+    return list_messages_page(folder=folder, query=query, unread_only=unread_only, limit=limit)["messages"]
 
 
 def _extract_body(payload: dict[str, Any] | None) -> str:

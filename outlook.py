@@ -128,15 +128,27 @@ def _auth() -> dict[str, str]:
     return {"Authorization": "Bearer " + get_token(), "Accept": "application/json"}
 
 
+def _recipients(rows: list[dict[str, Any]] | None) -> str:
+    return ", ".join((row.get("EmailAddress") or {}).get("Address", "") for row in rows or [])
+
+
 def _norm(m: dict[str, Any]) -> dict[str, Any]:
     frm = (m.get("From") or {}).get("EmailAddress") or {}
+    flag = m.get("Flag") or {}
     return {
         "provider": "outlook",
         "id": m.get("Id"),
+        "thread_id": m.get("ConversationId"),
         "from": f"{frm.get('Name','')} <{frm.get('Address','')}>".strip(),
+        "to": _recipients(m.get("ToRecipients")),
+        "cc": _recipients(m.get("CcRecipients")),
         "subject": m.get("Subject"),
         "date": m.get("ReceivedDateTime"),
         "unread": not m.get("IsRead", True),
+        "has_attachment": bool(m.get("HasAttachments")),
+        "importance": m.get("Importance") or "",
+        "flag_status": flag.get("FlagStatus", ""),
+        "categories": m.get("Categories") or [],
         "snippet": str(m.get("BodyPreview") or "")[:200],
         "folders": [m.get("ParentFolderId")] if m.get("ParentFolderId") else [],
     }
@@ -169,22 +181,46 @@ def list_folders() -> list[dict[str, Any]]:
             for f in data.get("value", [])]
 
 
-def list_messages(folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15) -> list[dict[str, Any]]:
-    sel = "$select=Id,Subject,From,ReceivedDateTime,IsRead,BodyPreview,ParentFolderId"
+def list_messages_page(
+    folder: str = "inbox",
+    query: str = "",
+    unread_only: bool = False,
+    limit: int = 15,
+    cursor: str = "",
+) -> dict[str, Any]:
+    if cursor:
+        data = http("GET", cursor, _auth())
+        return {
+            "provider": "outlook",
+            "messages": [_norm(m) for m in data.get("value", [])],
+            "next_cursor": data.get("@odata.nextLink", ""),
+            "total_count": data.get("@odata.count"),
+        }
+
+    sel = "$select=Id,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,IsRead,BodyPreview,ParentFolderId,Categories,HasAttachments,Importance,ConversationId,Flag"
     top = f"$top={int(limit)}"
     if folder and folder.lower() in ("all", "allitems"):
         path = f"{BASE}/me/messages"
     else:
         path = f"{BASE}/me/mailfolders/{_folder_id(folder)}/messages"
     if query:
-        qs = f"{top}&{sel}&$search=" + urllib.parse.quote('"' + query + '"')
+        qs = f"{top}&{sel}&$count=true&$search=" + urllib.parse.quote('"' + query + '"')
     else:
-        parts = [top, sel, "$orderby=ReceivedDateTime%20desc"]
+        parts = [top, sel, "$count=true", "$orderby=ReceivedDateTime%20desc"]
         if unread_only:
             parts.append("$filter=" + urllib.parse.quote("IsRead eq false"))
         qs = "&".join(parts)
     data = http("GET", f"{path}?{qs}", _auth())
-    return [_norm(m) for m in data.get("value", [])]
+    return {
+        "provider": "outlook",
+        "messages": [_norm(m) for m in data.get("value", [])],
+        "next_cursor": data.get("@odata.nextLink", ""),
+        "total_count": data.get("@odata.count"),
+    }
+
+
+def list_messages(folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15) -> list[dict[str, Any]]:
+    return list_messages_page(folder=folder, query=query, unread_only=unread_only, limit=limit)["messages"]
 
 
 def get_message(mid: str, body: bool = True) -> dict[str, Any]:
@@ -193,7 +229,7 @@ def get_message(mid: str, body: bool = True) -> dict[str, Any]:
         sel += ",Body"
     m = http("GET", f"{BASE}/me/messages/{mid}?$select={sel}", _auth())
     d = _norm(m)
-    d["to"] = ", ".join((r.get("EmailAddress") or {}).get("Address", "") for r in (m.get("ToRecipients") or []))
+    d["to"] = _recipients(m.get("ToRecipients"))
     d["categories"] = m.get("Categories") or []
     if body:
         b = m.get("Body") or {}
