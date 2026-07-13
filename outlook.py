@@ -1,111 +1,18 @@
-"""Outlook backend using the signed-in Safari OWA session.
-
-Imperial blocks normal mailbox API app registration. This backend reads OWA's own
-cached Outlook REST token from Safari localStorage, keeps it in memory, and uses
-it for reversible mail actions.
-"""
+"""Outlook REST backend using a platform-specific signed-in OWA session."""
 
 from __future__ import annotations
 
 import base64
 import json
-import subprocess
 import time
 import urllib.parse
 from typing import Any
 
-from common import CONFIG_DIR, audit, http
+from common import audit, http
+from outlook_tokens import extract_token
 
 BASE = "https://outlook.office.com/api/v2.0"
 _cache: dict[str, str | float | None] = {"token": None, "exp": 0.0}
-
-_JS = r"""
-(function () {
-  function dec(s){try{return JSON.parse(atob(s.replace(/-/g,'+').replace(/_/g,'/')
-    .padEnd(s.length+(4-s.length%4)%4,'=')))}catch(e){return null}}
-  function scan(store){
-    if(!store)return null;
-    for(var i=0;i<store.length;i++){
-      var k=store.key(i),v;try{v=store.getItem(k)}catch(e){continue}
-      if(typeof v!=='string')continue;
-      var re=/eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]+/g,m;
-      while((m=re.exec(v))!==null){
-        var p=dec(m[0].split('.')[1]);
-        if(p && p.aud==='https://outlook.office.com' && p.scp &&
-           p.scp.indexOf('Mail.Read')>=0){ return m[0]; }
-      }
-    }
-    return null;
-  }
-  return scan(window.localStorage)||scan(window.sessionStorage)||"NONE";
-})()
-"""
-_JS_PATH = CONFIG_DIR / "owa_tok.js"
-
-
-def _run_js() -> str:
-    _JS_PATH.write_text(_JS)
-    osa = f'''
-set jsCode to (read POSIX file "{_JS_PATH}" as «class utf8»)
-tell application "Safari"
-  repeat with w in windows
-    repeat with t in tabs of w
-      if (URL of t) contains "outlook" then
-        return (do JavaScript jsCode in t)
-      end if
-    end repeat
-  end repeat
-  return "NO_OWA_TAB"
-end tell
-'''
-    result = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Safari automation failed: "
-            + result.stderr.strip()
-            + "  [Fix: Safari ▸ Develop ▸ Allow JavaScript from Apple Events, and grant Automation permission]"
-        )
-    return result.stdout.strip()
-
-
-def _close_owa_tabs() -> None:
-    osa = '''
-tell application "Safari"
-  set toClose to {}
-  repeat with w in windows
-    repeat with t in tabs of w
-      if (URL of t) contains "outlook.office.com" or (URL of t) contains "outlook.cloud.microsoft" then
-        set end of toClose to t
-      end if
-    end repeat
-  end repeat
-  repeat with t in toClose
-    try
-      close t
-    end try
-  end repeat
-end tell
-'''
-    subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
-
-
-def _extract_token() -> str:
-    out = _run_js()
-    opened_by_us = False
-    if out == "NO_OWA_TAB":
-        subprocess.run(["open", "-g", "-a", "Safari", "https://outlook.office.com/mail/"])
-        opened_by_us = True
-        out = "NONE"
-    deadline = time.time() + 40
-    while out in ("NONE", "NO_OWA_TAB", "") and time.time() < deadline:
-        time.sleep(3)
-        out = _run_js()
-    token = out if out not in ("NONE", "NO_OWA_TAB", "") else None
-    if opened_by_us:
-        _close_owa_tabs()
-    if not token:
-        raise RuntimeError("No Outlook token in Safari. Open https://outlook.office.com in Safari and sign in once.")
-    return token
 
 
 def get_token() -> str:
@@ -113,7 +20,7 @@ def get_token() -> str:
     expires_at = float(_cache["exp"] or 0)
     if isinstance(token, str) and expires_at - time.time() > 300:
         return token
-    tok = _extract_token()
+    tok = extract_token()
     try:
         seg = tok.split(".")[1]
         payload = json.loads(base64.urlsafe_b64decode(seg + "=" * ((4 - len(seg) % 4) % 4)))
@@ -139,7 +46,7 @@ def _norm(m: dict[str, Any]) -> dict[str, Any]:
         "provider": "outlook",
         "id": m.get("Id"),
         "thread_id": m.get("ConversationId"),
-        "from": f"{frm.get('Name','')} <{frm.get('Address','')}>".strip(),
+        "from": f"{frm.get('Name', '')} <{frm.get('Address', '')}>".strip(),
         "to": _recipients(m.get("ToRecipients")),
         "cc": _recipients(m.get("CcRecipients")),
         "subject": m.get("Subject"),
@@ -155,10 +62,18 @@ def _norm(m: dict[str, Any]) -> dict[str, Any]:
 
 
 _WELL_KNOWN = {
-    "inbox": "inbox", "drafts": "drafts", "draft": "drafts",
-    "sent": "sentitems", "sentitems": "sentitems",
-    "trash": "deleteditems", "deleted": "deleteditems", "deleteditems": "deleteditems",
-    "junk": "junkemail", "spam": "junkemail", "junkemail": "junkemail", "archive": "archive",
+    "inbox": "inbox",
+    "drafts": "drafts",
+    "draft": "drafts",
+    "sent": "sentitems",
+    "sentitems": "sentitems",
+    "trash": "deleteditems",
+    "deleted": "deleteditems",
+    "deleteditems": "deleteditems",
+    "junk": "junkemail",
+    "spam": "junkemail",
+    "junkemail": "junkemail",
+    "archive": "archive",
 }
 
 
@@ -176,9 +91,15 @@ def _folder_id(name: str) -> str:
 
 def list_folders() -> list[dict[str, Any]]:
     data = http("GET", BASE + "/me/mailfolders?$top=100&$select=Id,DisplayName,UnreadItemCount,TotalItemCount", _auth())
-    return [{"id": f["Id"], "name": f.get("DisplayName"),
-             "unread": f.get("UnreadItemCount"), "total": f.get("TotalItemCount")}
-            for f in data.get("value", [])]
+    return [
+        {
+            "id": f["Id"],
+            "name": f.get("DisplayName"),
+            "unread": f.get("UnreadItemCount"),
+            "total": f.get("TotalItemCount"),
+        }
+        for f in data.get("value", [])
+    ]
 
 
 def list_messages_page(
@@ -219,7 +140,9 @@ def list_messages_page(
     }
 
 
-def list_messages(folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15) -> list[dict[str, Any]]:
+def list_messages(
+    folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15
+) -> list[dict[str, Any]]:
     return list_messages_page(folder=folder, query=query, unread_only=unread_only, limit=limit)["messages"]
 
 
@@ -255,8 +178,9 @@ def _current_folder(mid: str) -> str | None:
 def move_message(mid: str, to_folder: str) -> dict[str, Any]:
     before = _current_folder(mid)
     r = http("POST", f"{BASE}/me/messages/{mid}/move", _auth(), {"DestinationId": _folder_id(to_folder)})
-    audit({"provider": "outlook", "op": "move", "id": mid, "new_id": r.get("Id"),
-           "to": to_folder, "from_folder": before})
+    audit(
+        {"provider": "outlook", "op": "move", "id": mid, "new_id": r.get("Id"), "to": to_folder, "from_folder": before}
+    )
     return {"ok": True, "new_id": r.get("Id"), "moved_to": to_folder}
 
 
@@ -280,20 +204,21 @@ def tag_message(mid: str, labels: list[str] | str, mode: str = "add") -> dict[st
 def mark_read(mid: str, read: bool = True) -> dict[str, Any]:
     before = _message_state(mid)
     http("PATCH", f"{BASE}/me/messages/{mid}", _auth(), {"IsRead": bool(read)})
-    audit({
-        "provider": "outlook",
-        "op": "mark_read",
-        "id": mid,
-        "read": bool(read),
-        "before_is_read": before.get("IsRead") if before else None,
-    })
+    audit(
+        {
+            "provider": "outlook",
+            "op": "mark_read",
+            "id": mid,
+            "read": bool(read),
+            "before_is_read": before.get("IsRead") if before else None,
+        }
+    )
     return {"ok": True, "read": bool(read)}
 
 
 def flag_message(mid: str, on: bool = True) -> dict[str, Any]:
     before = _message_state(mid)
-    http("PATCH", f"{BASE}/me/messages/{mid}", _auth(),
-         {"Flag": {"FlagStatus": "Flagged" if on else "NotFlagged"}})
+    http("PATCH", f"{BASE}/me/messages/{mid}", _auth(), {"Flag": {"FlagStatus": "Flagged" if on else "NotFlagged"}})
     before_flag = (before.get("Flag") or {}).get("FlagStatus") if before else None
     audit({"provider": "outlook", "op": "flag", "id": mid, "on": bool(on), "before_flag_status": before_flag})
     return {"ok": True, "flagged": bool(on)}
@@ -323,15 +248,18 @@ def undo(e: dict[str, Any]) -> bool:
     op = e.get("op")
     if op in ("move", "trash"):
         nid = e.get("new_id") or e.get("id")
-        http("POST", f"{BASE}/me/messages/{nid}/move", _auth(),
-             {"DestinationId": e.get("from_folder") or "inbox"})
+        http("POST", f"{BASE}/me/messages/{nid}/move", _auth(), {"DestinationId": e.get("from_folder") or "inbox"})
         return True
     if op == "tag":
         http("PATCH", f"{BASE}/me/messages/{e['id']}", _auth(), {"Categories": e.get("before", [])})
         return True
     if op == "flag":
-        http("PATCH", f"{BASE}/me/messages/{e['id']}", _auth(),
-             {"Flag": {"FlagStatus": e.get("before_flag_status") or ("NotFlagged" if e.get("on") else "Flagged")}})
+        http(
+            "PATCH",
+            f"{BASE}/me/messages/{e['id']}",
+            _auth(),
+            {"Flag": {"FlagStatus": e.get("before_flag_status") or ("NotFlagged" if e.get("on") else "Flagged")}},
+        )
         return True
     if op == "mark_read":
         before_is_read = e.get("before_is_read")
@@ -343,24 +271,3 @@ def undo(e: dict[str, Any]) -> bool:
         )
         return True
     return False
-
-
-def _send_message(to: str, subject: str, body: str, cc: str = "") -> dict[str, Any]:
-    msg: dict[str, Any] = {
-        "Message": {
-            "Subject": subject,
-            "Body": {"ContentType": "Text", "Content": body},
-            "ToRecipients": [{"EmailAddress": {"Address": a.strip()}} for a in to.split(",") if a.strip()],
-        }
-    }
-    if cc:
-        msg["Message"]["CcRecipients"] = [{"EmailAddress": {"Address": a.strip()}} for a in cc.split(",") if a.strip()]
-    return http("POST", f"{BASE}/me/sendmail", _auth(), msg)
-
-
-def _permanent_delete(mid: str) -> dict[str, Any]:
-    return http("DELETE", f"{BASE}/me/messages/{mid}", _auth())
-
-
-def _empty_trash() -> None:
-    raise NotImplementedError("disabled by design")

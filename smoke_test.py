@@ -9,7 +9,9 @@ import outlook
 
 
 class ReadableMailbox(Protocol):
-    def list_messages(self, folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15) -> list[dict]: ...
+    def list_messages(
+        self, folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15
+    ) -> list[dict]: ...
 
 
 def _print_sample(name: str, backend: ReadableMailbox) -> None:
