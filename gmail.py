@@ -177,7 +177,9 @@ def list_messages_page(
     }
 
 
-def list_messages(folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15) -> list[dict[str, Any]]:
+def list_messages(
+    folder: str = "inbox", query: str = "", unread_only: bool = False, limit: int = 15
+) -> list[dict[str, Any]]:
     return list_messages_page(folder=folder, query=query, unread_only=unread_only, limit=limit)["messages"]
 
 
@@ -211,8 +213,9 @@ def _current_labels(mid: str) -> list[str]:
 
 
 def _modify(mid: str, add: list[str] | None = None, remove: list[str] | None = None) -> dict[str, Any]:
-    return http("POST", f"{API}/messages/{mid}/modify", _auth(),
-                {"addLabelIds": add or [], "removeLabelIds": remove or []})
+    return http(
+        "POST", f"{API}/messages/{mid}/modify", _auth(), {"addLabelIds": add or [], "removeLabelIds": remove or []}
+    )
 
 
 def _restore_labels(mid: str, labels: list[str]) -> None:
@@ -299,18 +302,3 @@ def undo(e: dict[str, Any]) -> bool:
         _restore_labels(mid, e.get("before_labels", []))
         return True
     return False
-
-
-def _send_message(to: str, subject: str, body: str, cc: str = "") -> dict[str, Any]:
-    em = EmailMessage()
-    em["To"] = to
-    if cc:
-        em["Cc"] = cc
-    em["Subject"] = subject
-    em.set_content(body)
-    raw = base64.urlsafe_b64encode(em.as_bytes()).decode()
-    return http("POST", f"{API}/messages/send", _auth(), {"raw": raw})
-
-
-def _permanent_delete(mid: str) -> dict[str, Any]:
-    return http("DELETE", f"{API}/messages/{mid}", _auth())

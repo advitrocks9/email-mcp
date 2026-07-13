@@ -36,13 +36,15 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
 def _exchange_code(client_id: str, client_secret: str, code: str) -> dict[str, Any]:
     request = urllib.request.Request(
         "https://oauth2.googleapis.com/token",
-        urllib.parse.urlencode({
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "redirect_uri": REDIRECT,
-            "grant_type": "authorization_code",
-        }).encode(),
+        urllib.parse.urlencode(
+            {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": code,
+                "redirect_uri": REDIRECT,
+                "grant_type": "authorization_code",
+            }
+        ).encode(),
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
@@ -75,15 +77,17 @@ def main() -> None:
     server = http.server.HTTPServer(("127.0.0.1", PORT), OAuthCallbackHandler)
     threading.Thread(target=server.handle_request, daemon=True).start()
     state = secrets.token_hex(8)
-    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
-        "client_id": client_id,
-        "redirect_uri": REDIRECT,
-        "response_type": "code",
-        "scope": SCOPE,
-        "access_type": "offline",
-        "prompt": "consent",
-        "state": state,
-    })
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "response_type": "code",
+            "scope": SCOPE,
+            "access_type": "offline",
+            "prompt": "consent",
+            "state": state,
+        }
+    )
     print("Opening browser for Google consent...\n", auth_url)
     webbrowser.open(auth_url)
 
@@ -92,12 +96,12 @@ def main() -> None:
             break
         time.sleep(1)
     if result.get("state") != state or "code" not in result:
-        sys.exit(f"auth failed: {result}")
+        sys.exit("Gmail authorization failed, was denied, or timed out.")
 
     token_response = _exchange_code(client_id, client_secret, result["code"])
     refresh_token = token_response.get("refresh_token")
     if not refresh_token:
-        sys.exit(f"No refresh_token returned. Revoke the prior grant and retry: {token_response}")
+        sys.exit("No refresh token returned. Revoke the prior grant and retry.")
 
     _write_refresh_token(str(refresh_token))
     print(f"Refresh token written to {PROJECT_DIR / '.env'} (not shown). Scope: {SCOPE}")

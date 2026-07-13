@@ -9,12 +9,17 @@ import pathlib
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
 CONFIG_DIR = pathlib.Path.home() / ".config" / "email-mcp"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    os.chmod(CONFIG_DIR, 0o700)
+except OSError:
+    pass
 AUDIT_LOG = CONFIG_DIR / "actions.log"
 HTTP_TIMEOUT_SECONDS = 30
 
@@ -30,9 +35,9 @@ def load_env() -> dict[str, str]:
                 continue
             key, value = line.split("=", 1)
             env[key.strip()] = value.strip().strip('"').strip("'")
-    for key in list(env):
-        if os.environ.get(key):
-            env[key] = os.environ[key]
+    for key, value in os.environ.items():
+        if key.startswith(("GMAIL_", "OUTLOOK_")):
+            env[key] = value
     return env
 
 
@@ -64,15 +69,29 @@ def http(
 
 def audit(entry: Mapping[str, Any]) -> None:
     entry = dict(entry)
-    entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
-    with AUDIT_LOG.open("a", encoding="utf-8") as handle:
+    entry.setdefault("action_id", uuid.uuid4().hex)
+    entry["ts"] = datetime.datetime.now().isoformat(timespec="microseconds")
+    descriptor = os.open(AUDIT_LOG, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
+    try:
+        os.chmod(AUDIT_LOG, 0o600)
+    except OSError:
+        pass
 
 
 def read_audit() -> list[dict[str, Any]]:
     if not AUDIT_LOG.exists():
         return []
-    return [json.loads(line) for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines() if line.strip()]
+    entries: list[dict[str, Any]] = []
+    for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
 
 
 def parse_date(value: object) -> float:
