@@ -13,27 +13,52 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
-CONFIG_DIR = pathlib.Path.home() / ".config" / "email-mcp"
+CONFIG_DIR = pathlib.Path.home() / ".email-mcp"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 AUDIT_LOG = CONFIG_DIR / "actions.log"
 HTTP_TIMEOUT_SECONDS = 30
 
 
+def env_file() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("EMAIL_MCP_CONFIG", PROJECT_DIR / ".env")).expanduser()
+
+
 def load_env() -> dict[str, str]:
     """Read KEY=VALUE pairs from ./.env; real environment overrides file."""
     env: dict[str, str] = {}
-    env_file = PROJECT_DIR / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
+    path = env_file()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
             env[key.strip()] = value.strip().strip('"').strip("'")
-    for key in list(env):
-        if os.environ.get(key):
-            env[key] = os.environ[key]
+    for key, value in os.environ.items():
+        if key.startswith(("GMAIL_", "OUTLOOK_")):
+            env[key] = value
     return env
+
+
+def set_env_value(key: str, value: str) -> None:
+    path = env_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    updated = False
+    output: list[str] = []
+    for line in lines:
+        if line.startswith(f"{key}="):
+            output.append(f"{key}={value}")
+            updated = True
+        else:
+            output.append(line)
+    if not updated:
+        output.append(f"{key}={value}")
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def http(

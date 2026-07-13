@@ -8,7 +8,7 @@ current MCP guidance that matters for this threat model.
 - Use `stdio`, not a long-running unauthenticated HTTP listener.
 - Document the exact startup command in the README and Codex/Claude config.
 - Keep the command deterministic with `uv run --frozen --directory ...`.
-- Keep secrets in `.env`, which is gitignored.
+- Keep secrets in `.env` or the path selected by `EMAIL_MCP_CONFIG`, which is never committed.
 
 Source: <https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices>
 
@@ -17,7 +17,7 @@ Source: <https://modelcontextprotocol.io/specification/2025-06-18/basic/security
 - Gmail uses `gmail.modify`, not a broader mail scope.
 - Send, permanent delete, and empty trash are not registered as MCP tools.
 - Mutations are reversible where the provider API permits it.
-- Each mutation writes an audit entry to `~/.config/email-mcp/actions.log`.
+- Each mutation writes an audit entry to `~/.email-mcp/actions.log`.
 
 Source: <https://modelcontextprotocol.io/specification/2025-06-18/basic/security_best_practices>
 
