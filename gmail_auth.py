@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import http.server
 import json
-import base64
-import hashlib
+import os
 import secrets
 import sys
 import threading
@@ -15,9 +14,11 @@ import urllib.request
 import webbrowser
 from typing import Any
 
-from common import env_file, load_env, set_env_value
+from common import PROJECT_DIR, load_env
 
 SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+PORT = 8765
+REDIRECT = f"http://localhost:{PORT}"
 result: dict[str, str] = {}
 
 
@@ -32,20 +33,36 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _exchange_code(client_id: str, client_secret: str, code: str, redirect: str, verifier: str) -> dict[str, Any]:
+def _exchange_code(client_id: str, client_secret: str, code: str) -> dict[str, Any]:
     request = urllib.request.Request(
         "https://oauth2.googleapis.com/token",
         urllib.parse.urlencode({
             "client_id": client_id,
             "client_secret": client_secret,
             "code": code,
-            "redirect_uri": redirect,
+            "redirect_uri": REDIRECT,
             "grant_type": "authorization_code",
-            "code_verifier": verifier,
         }).encode(),
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
+
+
+def _write_refresh_token(refresh_token: str) -> None:
+    env_file = PROJECT_DIR / ".env"
+    lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
+    out: list[str] = []
+    found = False
+    for line in lines:
+        if line.startswith("GMAIL_REFRESH_TOKEN="):
+            out.append(f"GMAIL_REFRESH_TOKEN={refresh_token}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"GMAIL_REFRESH_TOKEN={refresh_token}")
+    env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+    os.chmod(env_file, 0o600)
 
 
 def main() -> None:
@@ -55,22 +72,17 @@ def main() -> None:
     if not (client_id and client_secret):
         sys.exit("Set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in .env first.")
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), OAuthCallbackHandler)
-    redirect = f"http://127.0.0.1:{server.server_port}"
+    server = http.server.HTTPServer(("127.0.0.1", PORT), OAuthCallbackHandler)
     threading.Thread(target=server.handle_request, daemon=True).start()
     state = secrets.token_hex(8)
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
         "client_id": client_id,
-        "redirect_uri": redirect,
+        "redirect_uri": REDIRECT,
         "response_type": "code",
         "scope": SCOPE,
         "access_type": "offline",
         "prompt": "consent",
         "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
     })
     print("Opening browser for Google consent...\n", auth_url)
     webbrowser.open(auth_url)
@@ -82,13 +94,13 @@ def main() -> None:
     if result.get("state") != state or "code" not in result:
         sys.exit(f"auth failed: {result}")
 
-    token_response = _exchange_code(client_id, client_secret, result["code"], redirect, verifier)
+    token_response = _exchange_code(client_id, client_secret, result["code"])
     refresh_token = token_response.get("refresh_token")
     if not refresh_token:
         sys.exit(f"No refresh_token returned. Revoke the prior grant and retry: {token_response}")
 
-    set_env_value("GMAIL_REFRESH_TOKEN", str(refresh_token))
-    print(f"Refresh token written to {env_file()} (not shown). Scope: {SCOPE}")
+    _write_refresh_token(str(refresh_token))
+    print(f"Refresh token written to {PROJECT_DIR / '.env'} (not shown). Scope: {SCOPE}")
 
 
 if __name__ == "__main__":

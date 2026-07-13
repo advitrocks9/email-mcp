@@ -1,18 +1,20 @@
-"""Outlook backend using a user-owned Outlook web session."""
+"""Outlook backend using the signed-in Safari OWA session.
+
+Imperial blocks normal mailbox API app registration. This backend reads OWA's own
+cached Outlook REST token from Safari localStorage, keeps it in memory, and uses
+it for reversible mail actions.
+"""
 
 from __future__ import annotations
 
 import base64
 import json
-import os
-import socket
+import subprocess
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any
 
-from common import audit, http, load_env
+from common import CONFIG_DIR, audit, http
 
 BASE = "https://outlook.office.com/api/v2.0"
 _cache: dict[str, str | float | None] = {"token": None, "exp": 0.0}
@@ -24,7 +26,7 @@ _JS = r"""
   function scan(store){
     if(!store)return null;
     for(var i=0;i<store.length;i++){
-      var v;try{v=store.getItem(store.key(i))}catch(e){continue}
+      var k=store.key(i),v;try{v=store.getItem(k)}catch(e){continue}
       if(typeof v!=='string')continue;
       var re=/eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]+/g,m;
       while((m=re.exec(v))!==null){
@@ -38,90 +40,72 @@ _JS = r"""
   return scan(window.localStorage)||scan(window.sessionStorage)||"NONE";
 })()
 """
+_JS_PATH = CONFIG_DIR / "owa_tok.js"
 
 
-def _read_exact(sock: socket.socket, size: int) -> bytes:
-    data = b""
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise RuntimeError("Chrome DevTools closed the connection.")
-        data += chunk
-    return data
-
-
-def _send_frame(sock: socket.socket, payload: bytes) -> None:
-    mask = os.urandom(4)
-    size = len(payload)
-    if size < 126:
-        header = bytes([0x81, 0x80 | size])
-    elif size < 65536:
-        header = bytes([0x81, 0xFE]) + size.to_bytes(2, "big")
-    else:
-        header = bytes([0x81, 0xFF]) + size.to_bytes(8, "big")
-    masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-    sock.sendall(header + mask + masked)
-
-
-def _read_frame(sock: socket.socket) -> bytes:
-    first, second = _read_exact(sock, 2)
-    size = second & 0x7F
-    if size == 126:
-        size = int.from_bytes(_read_exact(sock, 2), "big")
-    elif size == 127:
-        size = int.from_bytes(_read_exact(sock, 8), "big")
-    masked = bool(second & 0x80)
-    mask = _read_exact(sock, 4) if masked else b""
-    payload = _read_exact(sock, size)
-    if masked:
-        payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-    if first & 0x0F == 0x8:
-        raise RuntimeError("Chrome DevTools closed the connection.")
-    return payload
-
-
-def _evaluate(websocket_url: str, expression: str) -> str:
-    parsed = urllib.parse.urlparse(websocket_url)
-    if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost"}:
-        raise RuntimeError("Outlook browser bridge must use a local Chrome DevTools endpoint.")
-    with socket.create_connection((parsed.hostname, parsed.port), timeout=10) as sock:
-        sock.settimeout(15)
-        key = base64.b64encode(os.urandom(16)).decode()
-        request = (
-            f"GET {parsed.path or '/'} HTTP/1.1\r\n"
-            f"Host: {parsed.hostname}:{parsed.port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
+def _run_js() -> str:
+    _JS_PATH.write_text(_JS)
+    osa = f'''
+set jsCode to (read POSIX file "{_JS_PATH}" as «class utf8»)
+tell application "Safari"
+  repeat with w in windows
+    repeat with t in tabs of w
+      if (URL of t) contains "outlook" then
+        return (do JavaScript jsCode in t)
+      end if
+    end repeat
+  end repeat
+  return "NO_OWA_TAB"
+end tell
+'''
+    result = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Safari automation failed: "
+            + result.stderr.strip()
+            + "  [Fix: Safari ▸ Develop ▸ Allow JavaScript from Apple Events, and grant Automation permission]"
         )
-        sock.sendall(request.encode())
-        if b" 101 " not in sock.recv(4096).split(b"\r\n", 1)[0]:
-            raise RuntimeError("Could not connect to Chrome DevTools.")
-        _send_frame(sock, json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": expression, "returnByValue": True}}).encode())
-        while True:
-            response = json.loads(_read_frame(sock))
-            if response.get("id") == 1:
-                return str(((response.get("result") or {}).get("result") or {}).get("value") or "")
+    return result.stdout.strip()
+
+
+def _close_owa_tabs() -> None:
+    osa = '''
+tell application "Safari"
+  set toClose to {}
+  repeat with w in windows
+    repeat with t in tabs of w
+      if (URL of t) contains "outlook.office.com" or (URL of t) contains "outlook.cloud.microsoft" then
+        set end of toClose to t
+      end if
+    end repeat
+  end repeat
+  repeat with t in toClose
+    try
+      close t
+    end try
+  end repeat
+end tell
+'''
+    subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
 
 
 def _extract_token() -> str:
-    env = load_env()
-    port = env.get("OUTLOOK_DEBUG_PORT", "9222")
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/json", timeout=5) as response:
-            tabs = json.load(response)
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        raise RuntimeError(
-            "Outlook browser bridge is unavailable. Start Chrome or Edge with remote debugging enabled, "
-            "open outlook.office.com, then set OUTLOOK_DEBUG_PORT if you did not use 9222."
-        ) from exc
-    for tab in tabs:
-        if tab.get("type") == "page" and "outlook" in str(tab.get("url", "")).lower():
-            token = _evaluate(str(tab.get("webSocketDebuggerUrl", "")), _JS)
-            if token and token != "NONE":
-                return token
-    raise RuntimeError("No signed-in Outlook web tab found in the browser bridge.")
+    out = _run_js()
+    opened_by_us = False
+    if out == "NO_OWA_TAB":
+        subprocess.run(["open", "-g", "-a", "Safari", "https://outlook.office.com/mail/"])
+        opened_by_us = True
+        out = "NONE"
+    deadline = time.time() + 40
+    while out in ("NONE", "NO_OWA_TAB", "") and time.time() < deadline:
+        time.sleep(3)
+        out = _run_js()
+    token = out if out not in ("NONE", "NO_OWA_TAB", "") else None
+    if opened_by_us:
+        _close_owa_tabs()
+    if not token:
+        raise RuntimeError("No Outlook token in Safari. Open https://outlook.office.com in Safari and sign in once.")
+    return token
 
 
 def get_token() -> str:
@@ -129,15 +113,15 @@ def get_token() -> str:
     expires_at = float(_cache["exp"] or 0)
     if isinstance(token, str) and expires_at - time.time() > 300:
         return token
-    token = _extract_token()
+    tok = _extract_token()
     try:
-        segment = token.split(".")[1]
-        payload = json.loads(base64.urlsafe_b64decode(segment + "=" * ((4 - len(segment) % 4) % 4)))
+        seg = tok.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(seg + "=" * ((4 - len(seg) % 4) % 4)))
         _cache["exp"] = float(payload.get("exp", time.time() + 1800))
-    except (IndexError, ValueError, json.JSONDecodeError):
+    except Exception:
         _cache["exp"] = time.time() + 1800
-    _cache["token"] = token
-    return token
+    _cache["token"] = tok
+    return tok
 
 
 def _auth() -> dict[str, str]:
